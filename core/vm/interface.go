@@ -90,6 +90,8 @@ type StateDB interface {
 	AddPreimage(common.Hash, []byte)
 
 	Witness() *stateless.Witness
+
+	SetOnCommit(onCommit tracing.CommitHook)
 }
 
 // CallContext provides a basic interface for the EVM calling conventions. The EVM
