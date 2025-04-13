@@ -273,6 +273,57 @@ func NewBlock(header *Header, body *Body, receipts []*Receipt, hasher TrieHasher
 	return b
 }
 
+// NewBlockForPipelineTrace only for pipeline tracing.
+func NewBlockForPipelineTrace(header *Header, body *Body, receipts []*Receipt, hasher TrieHasher) *Block {
+	if body == nil {
+		body = &Body{}
+	}
+	var (
+		b           = NewBlockWithHeader(header)
+		txs         = body.Transactions
+		uncles      = body.Uncles
+		withdrawals = body.Withdrawals
+	)
+
+	if len(txs) == 0 {
+		//b.header.TxHash = EmptyTxsHash
+	} else {
+		b.header.TxHash = DeriveSha(Transactions(txs), hasher)
+		b.transactions = make(Transactions, len(txs))
+		copy(b.transactions, txs)
+	}
+
+	if len(receipts) == 0 {
+		//b.header.ReceiptHash = EmptyReceiptsHash
+	} else {
+		b.header.ReceiptHash = DeriveSha(Receipts(receipts), hasher)
+		b.header.Bloom = CreateBloom(receipts)
+	}
+
+	if len(uncles) == 0 {
+		//b.header.UncleHash = EmptyUncleHash
+	} else {
+		b.header.UncleHash = CalcUncleHash(uncles)
+		b.uncles = make([]*Header, len(uncles))
+		for i := range uncles {
+			b.uncles[i] = CopyHeader(uncles[i])
+		}
+	}
+
+	if withdrawals == nil {
+		//b.header.WithdrawalsHash = nil
+	} else if len(withdrawals) == 0 {
+		//b.header.WithdrawalsHash = &EmptyWithdrawalsHash
+		//b.withdrawals = Withdrawals{}
+	} else {
+		hash := DeriveSha(Withdrawals(withdrawals), hasher)
+		b.header.WithdrawalsHash = &hash
+		b.withdrawals = slices.Clone(withdrawals)
+	}
+
+	return b
+}
+
 // CopyHeader creates a deep copy of a block header.
 func CopyHeader(h *Header) *Header {
 	cpy := *h
