@@ -171,7 +171,6 @@ func runTestTransactionAndGetBalance(
 			CanTransfer: func(vm.StateDB, common.Address, *uint256.Int) bool { return true },
 			Coinbase:    testCoinbase,
 		},
-		vm.TxContext{},
 		&dummyStateDB{
 			accountToTrack: address,
 		},
@@ -223,22 +222,25 @@ func (db *dummyStateDB) GetBalance(addr common.Address) *uint256.Int {
 	return uint256.NewInt(1_000_000)
 }
 
-func (db *dummyStateDB) AddBalance(addr common.Address, value *uint256.Int, _ tracing.BalanceChangeReason) {
+func (db *dummyStateDB) AddBalance(addr common.Address, value *uint256.Int, _ tracing.BalanceChangeReason) uint256.Int {
 	if addr == db.accountToTrack {
-		cur := db.GetBalance(addr)
-		db.accountBalance = cur.Add(cur, value)
+		previous := db.GetBalance(addr)
+		db.accountBalance = new(uint256.Int).Add(previous, value)
+		return *previous
 	}
+	return uint256.Int{}
 }
 
-func (*dummyStateDB) SubBalance(common.Address, *uint256.Int, tracing.BalanceChangeReason) {
+func (*dummyStateDB) SubBalance(common.Address, *uint256.Int, tracing.BalanceChangeReason) uint256.Int {
 	// ignored
+	return uint256.Int{}
 }
 
 func (*dummyStateDB) GetNonce(common.Address) uint64 {
 	return 0
 }
 
-func (*dummyStateDB) SetNonce(common.Address, uint64) {
+func (*dummyStateDB) SetNonce(common.Address, uint64, tracing.NonceChangeReason) {
 	// ignored
 }
 

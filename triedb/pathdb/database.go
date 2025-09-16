@@ -17,6 +17,7 @@
 package pathdb
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -31,25 +32,28 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/trie/trienode"
-	"github.com/ethereum/go-ethereum/trie/triestate"
+	"github.com/ethereum/go-verkle"
 )
 
 const (
-	// defaultCleanSize is the default memory allowance of clean cache.
-	defaultCleanSize = 16 * 1024 * 1024
+	// defaultTrieCleanSize is the default memory allowance of clean trie cache.
+	defaultTrieCleanSize = 16 * 1024 * 1024
+
+	// defaultStateCleanSize is the default memory allowance of clean state cache.
+	defaultStateCleanSize = 16 * 1024 * 1024
 
 	// maxBufferSize is the maximum memory allowance of node buffer.
-	// Too large nodebuffer will cause the system to pause for a long
+	// Too large buffer will cause the system to pause for a long
 	// time when write happens. Also, the largest batch that pebble can
 	// support is 4GB, node will panic if batch size exceeds this limit.
 	maxBufferSize = 256 * 1024 * 1024
 
-	// DefaultBufferSize is the default memory allowance of node buffer
+	// defaultBufferSize is the default memory allowance of node buffer
 	// that aggregates the writes from above until it's flushed into the
 	// disk. It's meant to be used once the initial sync is finished.
 	// Do not increase the buffer size arbitrarily, otherwise the system
 	// pause time will increase when the database writes happen.
-	DefaultBufferSize = 64 * 1024 * 1024
+	defaultBufferSize = 64 * 1024 * 1024
 )
 
 var (
@@ -64,8 +68,28 @@ type layer interface {
 	// if the read operation exits abnormally. Specifically, if the layer is
 	// already stale.
 	//
-	// Note, no error will be returned if the requested node is not found in database.
+	// Note:
+	// - the returned node is not a copy, please don't modify it.
+	// - no error will be returned if the requested node is not found in database.
 	node(owner common.Hash, path []byte, depth int) ([]byte, common.Hash, *nodeLoc, error)
+
+	// account directly retrieves the account RLP associated with a particular
+	// hash in the slim data format. An error will be returned if the read
+	// operation exits abnormally. Specifically, if the layer is already stale.
+	//
+	// Note:
+	// - the returned account is not a copy, please don't modify it.
+	// - no error will be returned if the requested account is not found in database.
+	account(hash common.Hash, depth int) ([]byte, error)
+
+	// storage directly retrieves the storage data associated with a particular hash,
+	// within a particular account. An error will be returned if the read operation
+	// exits abnormally. Specifically, if the layer is already stale.
+	//
+	// Note:
+	// - the returned storage data is not a copy, please don't modify it.
+	// - no error will be returned if the requested slot is not found in database.
+	storage(accountHash, storageHash common.Hash, depth int) ([]byte, error)
 
 	// rootHash returns the root hash for which this layer was made.
 	rootHash() common.Hash
@@ -80,7 +104,7 @@ type layer interface {
 	// the provided dirty trie nodes along with the state change set.
 	//
 	// Note, the maps are retained by the method to avoid copying everything.
-	update(root common.Hash, id uint64, block uint64, nodes map[common.Hash]map[string]*trienode.Node, states *triestate.Set) *diffLayer
+	update(root common.Hash, id uint64, block uint64, nodes *nodeSet, states *StateSetWithOrigin) *diffLayer
 
 	// journal commits an entire diff hierarchy to disk into a single journal entry.
 	// This is meant to be used during shutdown to persist the layer without
@@ -90,57 +114,112 @@ type layer interface {
 
 // Config contains the settings for database.
 type Config struct {
-	StateHistory   uint64 // Number of recent blocks to maintain state history for
-	CleanCacheSize int    // Maximum memory allowance (in bytes) for caching clean nodes
-	DirtyCacheSize int    // Maximum memory allowance (in bytes) for caching dirty nodes
-	ReadOnly       bool   // Flag whether the database is opened in read only mode.
+	StateHistory        uint64 // Number of recent blocks to maintain state history for
+	EnableStateIndexing bool   // Whether to enable state history indexing for external state access
+	TrieCleanSize       int    // Maximum memory allowance (in bytes) for caching clean trie nodes
+	StateCleanSize      int    // Maximum memory allowance (in bytes) for caching clean state data
+	WriteBufferSize     int    // Maximum memory allowance (in bytes) for write buffer
+	ReadOnly            bool   // Flag whether the database is opened in read only mode
+
+	// Testing configurations
+	SnapshotNoBuild   bool // Flag Whether the state generation is allowed
+	NoAsyncFlush      bool // Flag whether the background buffer flushing is allowed
+	NoAsyncGeneration bool // Flag whether the background generation is allowed
 }
 
 // sanitize checks the provided user configurations and changes anything that's
 // unreasonable or unworkable.
 func (c *Config) sanitize() *Config {
 	conf := *c
-	if conf.DirtyCacheSize > maxBufferSize {
-		log.Warn("Sanitizing invalid node buffer size", "provided", common.StorageSize(conf.DirtyCacheSize), "updated", common.StorageSize(maxBufferSize))
-		conf.DirtyCacheSize = maxBufferSize
+	if conf.WriteBufferSize > maxBufferSize {
+		log.Warn("Sanitizing invalid node buffer size", "provided", common.StorageSize(conf.WriteBufferSize), "updated", common.StorageSize(maxBufferSize))
+		conf.WriteBufferSize = maxBufferSize
 	}
 	return &conf
 }
 
+// fields returns a list of attributes of config for printing.
+func (c *Config) fields() []interface{} {
+	var list []interface{}
+	if c.ReadOnly {
+		list = append(list, "readonly", true)
+	}
+	if c.SnapshotNoBuild {
+		list = append(list, "snapshot", false)
+	}
+	list = append(list, "triecache", common.StorageSize(c.TrieCleanSize))
+	list = append(list, "statecache", common.StorageSize(c.StateCleanSize))
+	list = append(list, "buffer", common.StorageSize(c.WriteBufferSize))
+
+	if c.StateHistory == 0 {
+		list = append(list, "history", "entire chain")
+	} else {
+		list = append(list, "history", fmt.Sprintf("last %d blocks", c.StateHistory))
+	}
+	return list
+}
+
 // Defaults contains default settings for Ethereum mainnet.
 var Defaults = &Config{
-	StateHistory:   params.FullImmutabilityThreshold,
-	CleanCacheSize: defaultCleanSize,
-	DirtyCacheSize: DefaultBufferSize,
+	StateHistory:    params.FullImmutabilityThreshold,
+	TrieCleanSize:   defaultTrieCleanSize,
+	StateCleanSize:  defaultStateCleanSize,
+	WriteBufferSize: defaultBufferSize,
 }
 
 // ReadOnly is the config in order to open database in read only mode.
 var ReadOnly = &Config{ReadOnly: true}
 
-// Database is a multiple-layered structure for maintaining in-memory trie nodes.
-// It consists of one persistent base layer backed by a key-value store, on top
-// of which arbitrarily many in-memory diff layers are stacked. The memory diffs
-// can form a tree with branching, but the disk layer is singleton and common to
-// all. If a reorg goes deeper than the disk layer, a batch of reverse diffs can
-// be applied to rollback. The deepest reorg that can be handled depends on the
-// amount of state histories tracked in the disk.
+// nodeHasher is the function to compute the hash of supplied node blob.
+type nodeHasher func([]byte) (common.Hash, error)
+
+// merkleNodeHasher computes the hash of the given merkle node.
+func merkleNodeHasher(blob []byte) (common.Hash, error) {
+	if len(blob) == 0 {
+		return types.EmptyRootHash, nil
+	}
+	return crypto.Keccak256Hash(blob), nil
+}
+
+// verkleNodeHasher computes the hash of the given verkle node.
+func verkleNodeHasher(blob []byte) (common.Hash, error) {
+	if len(blob) == 0 {
+		return types.EmptyVerkleHash, nil
+	}
+	n, err := verkle.ParseNode(blob, 0)
+	if err != nil {
+		return common.Hash{}, err
+	}
+	return n.Commit().Bytes(), nil
+}
+
+// Database is a multiple-layered structure for maintaining in-memory states
+// along with its dirty trie nodes. It consists of one persistent base layer
+// backed by a key-value store, on top of which arbitrarily many in-memory diff
+// layers are stacked. The memory diffs can form a tree with branching, but the
+// disk layer is singleton and common to all. If a reorg goes deeper than the
+// disk layer, a batch of reverse diffs can be applied to rollback. The deepest
+// reorg that can be handled depends on the amount of state histories tracked
+// in the disk.
 //
 // At most one readable and writable database can be opened at the same time in
-// the whole system which ensures that only one database writer can operate disk
-// state. Unexpected open operations can cause the system to panic.
+// the whole system which ensures that only one database writer can operate the
+// persistent state. Unexpected open operations can cause the system to panic.
 type Database struct {
 	// readOnly is the flag whether the mutation is allowed to be applied.
 	// It will be set automatically when the database is journaled during
 	// the shutdown to reject all following unexpected mutations.
-	readOnly   bool                         // Flag if database is opened in read only mode
-	waitSync   bool                         // Flag if database is deactivated due to initial state sync
-	isVerkle   bool                         // Flag if database is used for verkle tree
-	bufferSize int                          // Memory allowance (in bytes) for caching dirty nodes
-	config     *Config                      // Configuration for database
-	diskdb     ethdb.Database               // Persistent storage for matured trie nodes
-	tree       *layerTree                   // The group for all known layers
-	freezer    ethdb.ResettableAncientStore // Freezer for storing trie histories, nil possible in tests
-	lock       sync.RWMutex                 // Lock to prevent mutations from happening at the same time
+	readOnly bool       // Flag if database is opened in read only mode
+	waitSync bool       // Flag if database is deactivated due to initial state sync
+	isVerkle bool       // Flag if database is used for verkle tree
+	hasher   nodeHasher // Trie node hasher
+
+	config  *Config                      // Configuration for database
+	diskdb  ethdb.Database               // Persistent storage for matured trie nodes
+	tree    *layerTree                   // The group for all known layers
+	freezer ethdb.ResettableAncientStore // Freezer for storing trie histories, nil possible in tests
+	lock    sync.RWMutex                 // Lock to prevent mutations from happening at the same time
+	indexer *historyIndexer              // History indexer
 }
 
 // New attempts to load an already existing layer from a persistent key-value
@@ -152,20 +231,21 @@ func New(diskdb ethdb.Database, config *Config, isVerkle bool) *Database {
 	}
 	config = config.sanitize()
 
+	db := &Database{
+		readOnly: config.ReadOnly,
+		isVerkle: isVerkle,
+		config:   config,
+		diskdb:   diskdb,
+		hasher:   merkleNodeHasher,
+	}
 	// Establish a dedicated database namespace tailored for verkle-specific
 	// data, ensuring the isolation of both verkle and merkle tree data. It's
 	// important to note that the introduction of a prefix won't lead to
 	// substantial storage overhead, as the underlying database will efficiently
 	// compress the shared key prefix.
 	if isVerkle {
-		diskdb = rawdb.NewTable(diskdb, string(rawdb.VerklePrefix))
-	}
-	db := &Database{
-		readOnly:   config.ReadOnly,
-		isVerkle:   isVerkle,
-		bufferSize: config.DirtyCacheSize,
-		config:     config,
-		diskdb:     diskdb,
+		db.diskdb = rawdb.NewTable(diskdb, string(rawdb.VerklePrefix))
+		db.hasher = verkleNodeHasher
 	}
 	// Construct the layer tree by resolving the in-disk singleton state
 	// and in-memory layer journal.
@@ -174,7 +254,7 @@ func New(diskdb ethdb.Database, config *Config, isVerkle bool) *Database {
 	// Repair the state history, which might not be aligned with the state
 	// in the key-value store due to an unclean shutdown.
 	if err := db.repairHistory(); err != nil {
-		log.Crit("Failed to repair pathdb", "err", err)
+		log.Crit("Failed to repair state history", "err", err)
 	}
 	// Disable database in case node is still in the initial state sync stage.
 	if rawdb.ReadSnapSyncStatusFlag(diskdb) == rawdb.StateSyncRunning && !db.readOnly {
@@ -182,6 +262,23 @@ func New(diskdb ethdb.Database, config *Config, isVerkle bool) *Database {
 			log.Crit("Failed to disable database", "err", err) // impossible to happen
 		}
 	}
+	// Resolving the state snapshot generation progress from the database is
+	// mandatory. This ensures that uncovered flat states are not accessed,
+	// even if background generation is not allowed. If permitted, the generation
+	// might be scheduled.
+	if err := db.setStateGenerator(); err != nil {
+		log.Crit("Failed to setup the generator", "err", err)
+	}
+	// TODO (rjl493456442) disable the background indexing in read-only mode
+	if db.freezer != nil && db.config.EnableStateIndexing {
+		db.indexer = newHistoryIndexer(db.diskdb, db.freezer, db.tree.bottom().stateID())
+		log.Info("Enabled state history indexing")
+	}
+	fields := config.fields()
+	if db.isVerkle {
+		fields = append(fields, "verkle", true)
+	}
+	log.Info("Initialized path database", fields...)
 	return db
 }
 
@@ -214,6 +311,11 @@ func (db *Database) repairHistory() error {
 			log.Crit("Failed to retrieve head of state history", "err", err)
 		}
 		if frozen != 0 {
+			// TODO(rjl493456442) would be better to group them into a batch.
+			//
+			// Purge all state history indexing data first
+			rawdb.DeleteStateHistoryIndexMetadata(db.diskdb)
+			rawdb.DeleteStateHistoryIndex(db.diskdb)
 			err := db.freezer.Reset()
 			if err != nil {
 				log.Crit("Failed to reset state histories", "err", err)
@@ -234,6 +336,66 @@ func (db *Database) repairHistory() error {
 	return nil
 }
 
+// setStateGenerator loads the state generation progress marker and potentially
+// resume the state generation if it's permitted.
+func (db *Database) setStateGenerator() error {
+	// Load the state snapshot generation progress marker to prevent access
+	// to uncovered states.
+	generator, root, err := loadGenerator(db.diskdb, db.hasher)
+	if err != nil {
+		return err
+	}
+	if generator == nil {
+		// Initialize an empty generator to rebuild the state snapshot from scratch
+		generator = &journalGenerator{
+			Marker: []byte{},
+		}
+	}
+	// Short circuit if the whole state snapshot has already been fully generated.
+	// The generator will be left as nil in disk layer for representing the whole
+	// state snapshot is available for accessing.
+	if generator.Done {
+		return nil
+	}
+	var origin uint64
+	if len(generator.Marker) >= 8 {
+		origin = binary.BigEndian.Uint64(generator.Marker)
+	}
+	stats := &generatorStats{
+		origin:   origin,
+		start:    time.Now(),
+		accounts: generator.Accounts,
+		slots:    generator.Slots,
+		storage:  common.StorageSize(generator.Storage),
+	}
+	dl := db.tree.bottom()
+
+	// Disable the background snapshot building in these circumstances:
+	// - the database is opened in read only mode
+	// - the snapshot build is explicitly disabled
+	// - the database is opened in verkle tree mode
+	noBuild := db.readOnly || db.config.SnapshotNoBuild || db.isVerkle
+
+	// Construct the generator and link it to the disk layer, ensuring that the
+	// generation progress is resolved to prevent accessing uncovered states
+	// regardless of whether background state snapshot generation is allowed.
+	dl.setGenerator(newGenerator(db.diskdb, noBuild, generator.Marker, stats))
+
+	// Short circuit if the background generation is not permitted
+	if noBuild || db.waitSync {
+		return nil
+	}
+	stats.log("Starting snapshot generation", root, generator.Marker)
+	dl.generator.run(root)
+
+	// Block until the generation completes. It's the feature used in
+	// unit tests.
+	if db.config.NoAsyncGeneration {
+		<-dl.generator.done
+	}
+	return nil
+}
+
 // Update adds a new layer into the tree, if that can be linked to an existing
 // old parent. It is disallowed to insert a disk layer (the origin of all). Apart
 // from that this function will flatten the extra diff layers at bottom into disk
@@ -241,7 +403,9 @@ func (db *Database) repairHistory() error {
 //
 // The passed in maps(nodes, states) will be retained to avoid copying everything.
 // Therefore, these maps must not be changed afterwards.
-func (db *Database) Update(root common.Hash, parentRoot common.Hash, block uint64, nodes *trienode.MergedNodeSet, states *triestate.Set) error {
+//
+// The supplied parentRoot and root must be a valid trie hash value.
+func (db *Database) Update(root common.Hash, parentRoot common.Hash, block uint64, nodes *trienode.MergedNodeSet, states *StateSetWithOrigin) error {
 	// Hold the lock to prevent concurrent mutations.
 	db.lock.Lock()
 	defer db.lock.Unlock()
@@ -294,8 +458,13 @@ func (db *Database) Disable() error {
 	}
 	db.waitSync = true
 
-	// Mark the disk layer as stale to prevent access to persistent state.
-	db.tree.bottom().markStale()
+	// Terminate the state generator if it's active and mark the disk layer
+	// as stale to prevent access to persistent state.
+	disk := db.tree.bottom()
+	if err := disk.terminate(); err != nil {
+		return err
+	}
+	disk.markStale()
 
 	// Write the initial sync flag to persist it across restarts.
 	rawdb.WriteSnapSyncStatusFlag(db.diskdb, rawdb.StateSyncRunning)
@@ -314,10 +483,9 @@ func (db *Database) Enable(root common.Hash) error {
 		return errDatabaseReadOnly
 	}
 	// Ensure the provided state root matches the stored one.
-	root = types.TrieRootHash(root)
-	stored := types.EmptyRootHash
-	if blob := rawdb.ReadAccountTrieNode(db.diskdb, nil); len(blob) > 0 {
-		stored = crypto.Keccak256Hash(blob)
+	stored, err := db.hasher(rawdb.ReadAccountTrieNode(db.diskdb, nil))
+	if err != nil {
+		return err
 	}
 	if stored != root {
 		return fmt.Errorf("state root mismatch: stored %x, synced %x", stored, root)
@@ -326,6 +494,7 @@ func (db *Database) Enable(root common.Hash) error {
 	// reset the persistent state id back to zero.
 	batch := db.diskdb.NewBatch()
 	rawdb.DeleteTrieJournal(batch)
+	rawdb.DeleteSnapshotRoot(batch)
 	rawdb.WritePersistentStateID(batch, 0)
 	if err := batch.Write(); err != nil {
 		return err
@@ -335,17 +504,22 @@ func (db *Database) Enable(root common.Hash) error {
 	// mappings can be huge and might take a while to clear
 	// them, just leave them in disk and wait for overwriting.
 	if db.freezer != nil {
+		// TODO(rjl493456442) would be better to group them into a batch.
+		//
+		// Purge all state history indexing data first
+		rawdb.DeleteStateHistoryIndexMetadata(db.diskdb)
+		rawdb.DeleteStateHistoryIndex(db.diskdb)
 		if err := db.freezer.Reset(); err != nil {
 			return err
 		}
 	}
-	// Re-construct a new disk layer backed by persistent state
-	// with **empty clean cache and node buffer**.
-	db.tree.reset(newDiskLayer(root, 0, db, nil, newNodeBuffer(db.bufferSize, nil, 0)))
-
 	// Re-enable the database as the final step.
 	db.waitSync = false
 	rawdb.WriteSnapSyncStatusFlag(db.diskdb, rawdb.StateSyncFinished)
+
+	// Re-construct a new disk layer backed by persistent state
+	// and schedule the state snapshot generation if it's permitted.
+	db.tree.init(generateSnapshot(db, root, db.isVerkle || db.config.SnapshotNoBuild))
 	log.Info("Rebuilt trie database", "root", root)
 	return nil
 }
@@ -353,23 +527,24 @@ func (db *Database) Enable(root common.Hash) error {
 // Recover rollbacks the database to a specified historical point.
 // The state is supported as the rollback destination only if it's
 // canonical state and the corresponding trie histories are existent.
+//
+// The supplied root must be a valid trie hash value.
 func (db *Database) Recover(root common.Hash) error {
 	db.lock.Lock()
 	defer db.lock.Unlock()
 
-	// Short circuit if rollback operation is not supported.
+	// Short circuit if rollback operation is not supported
 	if err := db.modifyAllowed(); err != nil {
 		return err
 	}
 	if db.freezer == nil {
 		return errors.New("state rollback is non-supported")
 	}
-	// Short circuit if the target state is not recoverable.
-	root = types.TrieRootHash(root)
+	// Short circuit if the target state is not recoverable
 	if !db.Recoverable(root) {
 		return errStateUnrecoverable
 	}
-	// Apply the state histories upon the disk layer in order.
+	// Apply the state histories upon the disk layer in order
 	var (
 		start = time.Now()
 		dl    = db.tree.bottom()
@@ -386,9 +561,18 @@ func (db *Database) Recover(root common.Hash) error {
 		// reset layer with newly created disk layer. It must be
 		// done after each revert operation, otherwise the new
 		// disk layer won't be accessible from outside.
-		db.tree.reset(dl)
+		db.tree.init(dl)
 	}
 	rawdb.DeleteTrieJournal(db.diskdb)
+
+	// Explicitly sync the key-value store to ensure all recent writes are
+	// flushed to disk. This step is crucial to prevent a scenario where
+	// recent key-value writes are lost due to an application panic, while
+	// the associated state histories have already been removed, resulting
+	// in the inability to perform a state rollback.
+	if err := db.diskdb.SyncKeyValue(); err != nil {
+		return err
+	}
 	_, err := truncateFromHead(db.diskdb, db.freezer, dl.stateID())
 	if err != nil {
 		return err
@@ -398,15 +582,16 @@ func (db *Database) Recover(root common.Hash) error {
 }
 
 // Recoverable returns the indicator if the specified state is recoverable.
+//
+// The supplied root must be a valid trie hash value.
 func (db *Database) Recoverable(root common.Hash) bool {
 	// Ensure the requested state is a known state.
-	root = types.TrieRootHash(root)
 	id := rawdb.ReadStateID(db.diskdb, root)
 	if id == nil {
 		return false
 	}
-	// Recoverable state must below the disk layer. The recoverable
-	// state only refers the state that is currently not available,
+	// Recoverable state must be below the disk layer. The recoverable
+	// state only refers to the state that is currently not available,
 	// but can be restored by applying state history.
 	dl := db.tree.bottom()
 	if *id >= dl.stateID() {
@@ -439,9 +624,19 @@ func (db *Database) Close() error {
 	// following mutations.
 	db.readOnly = true
 
-	// Release the memory held by clean cache.
-	db.tree.bottom().resetCache()
+	// Block until the background flushing is finished. It must
+	// be done before terminating the potential background snapshot
+	// generator.
+	dl := db.tree.bottom()
+	if err := dl.terminate(); err != nil {
+		return err
+	}
+	dl.resetCache() // release the memory held by clean cache
 
+	// Terminate the background state history indexer
+	if db.indexer != nil {
+		db.indexer.close()
+	}
 	// Close the attached state history freezer.
 	if db.freezer == nil {
 		return nil
@@ -454,41 +649,13 @@ func (db *Database) Close() error {
 func (db *Database) Size() (diffs common.StorageSize, nodes common.StorageSize) {
 	db.tree.forEach(func(layer layer) {
 		if diff, ok := layer.(*diffLayer); ok {
-			diffs += common.StorageSize(diff.memory)
+			diffs += common.StorageSize(diff.size())
 		}
 		if disk, ok := layer.(*diskLayer); ok {
 			nodes += disk.size()
 		}
 	})
 	return diffs, nodes
-}
-
-// Initialized returns an indicator if the state data is already
-// initialized in path-based scheme.
-func (db *Database) Initialized(genesisRoot common.Hash) bool {
-	var inited bool
-	db.tree.forEach(func(layer layer) {
-		if layer.rootHash() != types.EmptyRootHash {
-			inited = true
-		}
-	})
-	if !inited {
-		inited = rawdb.ReadSnapSyncStatusFlag(db.diskdb) != rawdb.StateSyncUnknown
-	}
-	return inited
-}
-
-// SetBufferSize sets the node buffer size to the provided value(in bytes).
-func (db *Database) SetBufferSize(size int) error {
-	db.lock.Lock()
-	defer db.lock.Unlock()
-
-	if size > maxBufferSize {
-		log.Info("Capped node buffer size", "provided", common.StorageSize(size), "adjusted", common.StorageSize(maxBufferSize))
-		size = maxBufferSize
-	}
-	db.bufferSize = size
-	return db.tree.bottom().setBufferSize(db.bufferSize)
 }
 
 // modifyAllowed returns the indicator if mutation is allowed. This function
@@ -531,4 +698,43 @@ func (db *Database) StorageHistory(address common.Address, slot common.Hash, sta
 // state history in the local store.
 func (db *Database) HistoryRange() (uint64, uint64, error) {
 	return historyRange(db.freezer)
+}
+
+// IndexProgress returns the indexing progress made so far. It provides the
+// number of states that remain unindexed.
+func (db *Database) IndexProgress() (uint64, error) {
+	if db.indexer == nil {
+		return 0, nil
+	}
+	return db.indexer.progress()
+}
+
+// AccountIterator creates a new account iterator for the specified root hash and
+// seeks to a starting account hash.
+func (db *Database) AccountIterator(root common.Hash, seek common.Hash) (AccountIterator, error) {
+	db.lock.RLock()
+	wait := db.waitSync
+	db.lock.RUnlock()
+	if wait {
+		return nil, errDatabaseWaitSync
+	}
+	if !db.tree.bottom().genComplete() {
+		return nil, errNotConstructed
+	}
+	return newFastAccountIterator(db, root, seek)
+}
+
+// StorageIterator creates a new storage iterator for the specified root hash and
+// account. The iterator will be moved to the specific start position.
+func (db *Database) StorageIterator(root common.Hash, account common.Hash, seek common.Hash) (StorageIterator, error) {
+	db.lock.RLock()
+	wait := db.waitSync
+	db.lock.RUnlock()
+	if wait {
+		return nil, errDatabaseWaitSync
+	}
+	if !db.tree.bottom().genComplete() {
+		return nil, errNotConstructed
+	}
+	return newFastStorageIterator(db, root, account, seek)
 }

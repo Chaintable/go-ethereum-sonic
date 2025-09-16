@@ -23,8 +23,6 @@ type TestStateDB interface {
 	// Logs returns the logs of the current transaction.
 	Logs() []*types.Log
 
-	SetLogger(l *tracing.Hooks)
-
 	// SetBalance sets the balance of the given account.
 	SetBalance(addr common.Address, amount *uint256.Int, reason tracing.BalanceChangeReason)
 
@@ -32,7 +30,7 @@ type TestStateDB interface {
 	IntermediateRoot(deleteEmptyObjects bool) common.Hash
 
 	// Commit commits the state to the underlying trie database and returns state root hash.
-	Commit(block uint64, deleteEmptyObjects bool) (common.Hash, error)
+	Commit(block uint64, deleteEmptyObjects bool, noStorageWiping bool) (common.Hash, error)
 }
 
 // TestContextFactory is an interface for creating test configurations.
