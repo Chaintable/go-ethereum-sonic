@@ -8,8 +8,8 @@ import (
 
 func TestGetInterpreter_ProducesInterpretersBasedOnConfiguration(t *testing.T) {
 	var (
-		a         = &EVMInterpreter{}
-		b         = &EVMInterpreter{}
+		a         = &evmInterpreter{}
+		b         = &evmInterpreter{}
 		none      InterpreterFactory
 		useA      = func(*EVM) Interpreter { return a }
 		useB      = func(*EVM) Interpreter { return b }

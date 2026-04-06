@@ -57,12 +57,16 @@ type CallContextInterceptor interface {
 
 // Interpreter defines an interface for different interpreter implementations.
 type Interpreter interface {
-	// Run the contract's code with the given input data and returns the return byte-slice
-	// and an error if one occurred.
-	Run(contract *Contract, input []byte, readOnly bool) (ret []byte, err error)
+	// Interpret runs the contract's code with the given input data and returns
+	// the return byte-slice and an error if one occurred.
+	Interpret(contract *Contract, input []byte, readOnly bool) (ret []byte, err error)
 }
 
 type InterpreterFactory func(evm *EVM) Interpreter
+
+func NewEvmInterpreter(evm *EVM) evmInterpreter {
+	return evmInterpreter{evm: evm}
+}
 
 func getInterpreter(evm *EVM) Interpreter {
 	// No Tosca interpreter is supporting tracing yet. Thus, if
@@ -76,7 +80,7 @@ func getInterpreter(evm *EVM) Interpreter {
 	if config.Interpreter != nil {
 		return config.Interpreter(evm)
 	}
-	return NewEVMInterpreter(evm)
+	return NewEvmInterpreter(evm)
 }
 
 // --- Abstracted interpreter with step execution ---
@@ -105,9 +109,9 @@ type InterpreterState struct {
 	ReturnData         []byte
 }
 
-func (in *EVMInterpreter) Step(state *InterpreterState) {
+func (evm *EVM) Step(state *InterpreterState) {
 	// run a single operation
-	res, err := in.run(state, 1)
+	res, err := evmInterpreter{evm: evm}.runSteps(state, 1)
 	if errors.Is(err, ErrExecutionReverted) {
 		state.Status = Reverted
 		state.ReturnData = res
@@ -121,5 +125,5 @@ func (in *EVMInterpreter) Step(state *InterpreterState) {
 	}
 
 	// extract internal interpreter state
-	state.LastCallReturnData = in.returnData
+	state.LastCallReturnData = evm.returnData
 }
